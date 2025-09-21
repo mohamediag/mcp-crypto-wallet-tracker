@@ -1,31 +1,59 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 )
 
 const (
-	etherscanAPIKey  = "8C1S8AXN7CRBGGUE2VT6493UPBI9ZCAT9W"
-	etherscanBaseURL = "https://api.etherscan.io/api"
-
-	// Token field names
-	fieldContractAddress = "contractAddress"
-	fieldTokenName       = "tokenName"
-	fieldTokenNameAlt    = "TokenName"
-	fieldTokenSymbol     = "tokenSymbol"
-	fieldTokenSymbolAlt  = "TokenSymbol"
+	etherscanBaseURL   = "https://api.etherscan.io/api"
+	defaultHTTPTimeout = 10 * time.Second
 )
+
+var (
+	ErrInvalidWalletAddress = errors.New("invalid ethereum address")
+	ErrNoTransactions       = errors.New("no token transactions found")
+)
+
+type WalletTracker struct {
+	client  *http.Client
+	baseURL string
+	apiKey  string
+}
+
+func NewWalletTracker(apiKey string) (*WalletTracker, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, errors.New("api key must not be empty")
+	}
+
+	return &WalletTracker{
+		client: &http.Client{
+			Timeout: defaultHTTPTimeout,
+		},
+		baseURL: etherscanBaseURL,
+		apiKey:  apiKey,
+	}, nil
+}
 
 type TokenBalance struct {
 	Address string `json:"address"`
 	Name    string `json:"name"`
+	Symbol  string `json:"symbol"`
+	Balance string `json:"balance"`
 }
 
 type WalletResponse struct {
@@ -33,169 +61,325 @@ type WalletResponse struct {
 	Tokens  []TokenBalance `json:"tokens"`
 }
 
-type TokenInfo struct {
-	TokenName       string `json:"TokenName"`
-	TokenSymbol     string `json:"TokenSymbol"`
-	TokenQuantity   string `json:"TokenQuantity"`
-	TokenDivisor    string `json:"TokenDivisor"`
-	ContractAddress string `json:"contractAddress"`
-	TokenDecimal    string `json:"TokenDecimal"`
-}
-
-type EtherscanResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Result  any    `json:"result"`
-}
-
-func getWalletTokens(walletAddress string) (*WalletResponse, error) {
-	etherscanResp, err := fetchTokenTransactions(walletAddress)
-	if err != nil {
+func (t *WalletTracker) GetWalletTokens(ctx context.Context, walletAddress string) (*WalletResponse, error) {
+	if err := validateWalletAddress(walletAddress); err != nil {
 		return nil, err
 	}
 
-	tokens, err := processTokenTransactions(etherscanResp.Result)
+	txs, err := t.fetchTokenTransactions(ctx, walletAddress)
 	if err != nil {
+		if errors.Is(err, ErrNoTransactions) {
+			return &WalletResponse{
+				Address: walletAddress,
+				Tokens:  []TokenBalance{},
+			}, nil
+		}
 		return nil, err
 	}
 
+	tokens := summarizeTokenBalances(walletAddress, txs)
 	return &WalletResponse{
 		Address: walletAddress,
 		Tokens:  tokens,
 	}, nil
 }
 
-func fetchTokenTransactions(walletAddress string) (*EtherscanResponse, error) {
-	url := fmt.Sprintf("%s?module=account&action=tokentx&address=%s&startblock=0&endblock=999999999&sort=asc&apikey=%s",
-		etherscanBaseURL, walletAddress, etherscanAPIKey)
-
-	log.Printf("Fetching token transactions for wallet: %s", walletAddress)
-
-	resp, err := http.Get(url)
+func (t *WalletTracker) fetchTokenTransactions(ctx context.Context, walletAddress string) ([]tokenTransaction, error) {
+	endpoint, err := url.Parse(t.baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch token transactions from Etherscan: %w", err)
+		return nil, fmt.Errorf("parsing etherscan base URL: %w", err)
+	}
+
+	query := endpoint.Query()
+	query.Set("module", "account")
+	query.Set("action", "tokentx")
+	query.Set("address", walletAddress)
+	query.Set("startblock", "0")
+	query.Set("endblock", "999999999")
+	query.Set("sort", "asc")
+	query.Set("apikey", t.apiKey)
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating etherscan request: %w", err)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("calling etherscan: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("etherscan responded with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var apiResp etherscanResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("decoding etherscan response: %w", err)
+	}
+
+	txs, err := apiResp.tokenTransactions()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Etherscan response body: %w", err)
-	}
-
-	var etherscanResp EtherscanResponse
-	if err := json.Unmarshal(body, &etherscanResp); err != nil {
-		return nil, fmt.Errorf("failed to parse Etherscan JSON response: %w", err)
-	}
-
-	if etherscanResp.Status == "0" {
-		return nil, fmt.Errorf("Etherscan API returned error (status: %s): %s",
-			etherscanResp.Status, etherscanResp.Message)
-	}
-
-	log.Printf("Successfully fetched token transactions, result type: %T", etherscanResp.Result)
-
-	return &etherscanResp, nil
-}
-
-func processTokenTransactions(result any) ([]TokenBalance, error) {
-	tokenMap := make(map[string]TokenBalance)
-
-	switch result := result.(type) {
-	case string:
-		log.Printf("No token transactions found")
-		return []TokenBalance{}, nil
-	case []any:
-		log.Printf("Processing %d token transactions", len(result))
-		for _, item := range result {
-			if tokenData, ok := item.(map[string]any); ok {
-				token := createTokenFromData(tokenData)
-				tokenMap[token.Address] = token
-			}
+		if errors.Is(err, ErrNoTransactions) {
+			return nil, ErrNoTransactions
 		}
-	default:
-		log.Printf("Unexpected result type: %T", result)
-		return nil, fmt.Errorf("unexpected result type from Etherscan API: %T, expected string or []any", result)
+		return nil, err
 	}
 
-	// Convert token map to slice
-	var tokens []TokenBalance
-	for _, token := range tokenMap {
-		tokens = append(tokens, token)
+	if apiResp.Status == "0" {
+		if strings.EqualFold(apiResp.Message, "No transactions found") {
+			return nil, ErrNoTransactions
+		}
+		return nil, fmt.Errorf("etherscan api error: %s", apiResp.Message)
 	}
 
-	log.Printf("Found %d unique tokens", len(tokens))
-	return tokens, nil
+	return txs, nil
 }
 
-func createTokenFromData(tokenData map[string]any) TokenBalance {
-	contractAddress := getString(tokenData, fieldContractAddress)
-	tokenName := getString(tokenData, fieldTokenName)
-	tokenSymbol := getString(tokenData, fieldTokenSymbol)
-
-	// Try alternative field names if standard ones are empty
-	if tokenName == "" {
-		tokenName = getString(tokenData, fieldTokenNameAlt)
-	}
-	if tokenSymbol == "" {
-		tokenSymbol = getString(tokenData, fieldTokenSymbolAlt)
-	}
-
-	// Use symbol as name if name is still empty
-	displayName := tokenName
-	if displayName == "" && tokenSymbol != "" {
-		displayName = tokenSymbol
-	}
-
-	log.Printf("Processing token: %s (%s)", contractAddress, displayName)
-
-	return TokenBalance{
-		Address: contractAddress,
-		Name:    displayName,
-	}
+type etherscanResponse struct {
+	Status  string          `json:"status"`
+	Message string          `json:"message"`
+	Result  json.RawMessage `json:"result"`
 }
 
-func getString(data map[string]any, key string) string {
-	if val, ok := data[key]; ok {
-		if str, ok := val.(string); ok {
-			return str
+func (r etherscanResponse) tokenTransactions() ([]tokenTransaction, error) {
+	if len(r.Result) == 0 {
+		return []tokenTransaction{}, nil
+	}
+
+	var text string
+	if err := json.Unmarshal(r.Result, &text); err == nil {
+		if strings.EqualFold(text, "No transactions found") {
+			return nil, ErrNoTransactions
+		}
+		return nil, fmt.Errorf("unexpected result text: %s", text)
+	}
+
+	var txs []tokenTransaction
+	if err := json.Unmarshal(r.Result, &txs); err != nil {
+		return nil, fmt.Errorf("parsing token transactions: %w", err)
+	}
+	return txs, nil
+}
+
+type tokenTransaction struct {
+	ContractAddress  string `json:"contractAddress"`
+	TokenName        string `json:"tokenName"`
+	TokenNameAlt     string `json:"TokenName"`
+	TokenSymbol      string `json:"tokenSymbol"`
+	TokenSymbolAlt   string `json:"TokenSymbol"`
+	TokenDecimal     string `json:"tokenDecimal"`
+	TokenDecimalAlt  string `json:"TokenDecimal"`
+	TokenQuantity    string `json:"value"`
+	TokenQuantityAlt string `json:"TokenQuantity"`
+	From             string `json:"from"`
+	To               string `json:"to"`
+}
+
+func (t tokenTransaction) displayName() string {
+	if t.TokenName != "" {
+		return t.TokenName
+	}
+	if t.TokenNameAlt != "" {
+		return t.TokenNameAlt
+	}
+	if sym := t.displaySymbol(); sym != "" {
+		return sym
+	}
+	return t.ContractAddress
+}
+
+func (t tokenTransaction) displaySymbol() string {
+	if t.TokenSymbol != "" {
+		return t.TokenSymbol
+	}
+	if t.TokenSymbolAlt != "" {
+		return t.TokenSymbolAlt
+	}
+	return ""
+}
+
+func (t tokenTransaction) decimals() int {
+	if raw := firstNonEmpty(t.TokenDecimal, t.TokenDecimalAlt); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func (t tokenTransaction) quantity() *big.Int {
+	raw := firstNonEmpty(t.TokenQuantity, t.TokenQuantityAlt)
+	if raw == "" {
+		return nil
+	}
+
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok {
+		return nil
+	}
+	return value
+}
+
+type tokenAggregate struct {
+	address  string
+	name     string
+	symbol   string
+	decimals int
+	balance  *big.Int
+}
+
+func summarizeTokenBalances(walletAddress string, txs []tokenTransaction) []TokenBalance {
+	if len(txs) == 0 {
+		return []TokenBalance{}
+	}
+
+	wallet := strings.ToLower(walletAddress)
+	aggregates := make(map[string]*tokenAggregate)
+
+	for _, tx := range txs {
+		qty := tx.quantity()
+		if qty == nil {
+			log.Printf("Skipping transaction with invalid quantity for contract %s", tx.ContractAddress)
+			continue
+		}
+
+		agg, ok := aggregates[tx.ContractAddress]
+		if !ok {
+			agg = &tokenAggregate{
+				address:  tx.ContractAddress,
+				name:     tx.displayName(),
+				symbol:   tx.displaySymbol(),
+				decimals: tx.decimals(),
+				balance:  big.NewInt(0),
+			}
+			aggregates[tx.ContractAddress] = agg
+		}
+
+		to := strings.ToLower(tx.To)
+		from := strings.ToLower(tx.From)
+
+		switch {
+		case to == wallet:
+			agg.balance.Add(agg.balance, qty)
+		case from == wallet:
+			agg.balance.Sub(agg.balance, qty)
+		}
+	}
+
+	result := make([]TokenBalance, 0, len(aggregates))
+	for _, agg := range aggregates {
+		if agg.balance.Sign() == 0 {
+			continue
+		}
+		result = append(result, TokenBalance{
+			Address: agg.address,
+			Name:    agg.name,
+			Symbol:  agg.symbol,
+			Balance: formatTokenBalance(agg.balance, agg.decimals),
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
+
+	return result
+}
+
+func formatTokenBalance(balance *big.Int, decimals int) string {
+	if balance == nil {
+		return "0"
+	}
+
+	sign := ""
+	value := new(big.Int).Set(balance)
+	if value.Sign() < 0 {
+		sign = "-"
+		value.Abs(value)
+	}
+
+	if decimals <= 0 {
+		return sign + value.String()
+	}
+
+	str := value.String()
+	if len(str) <= decimals {
+		str = strings.Repeat("0", decimals-len(str)+1) + str
+	}
+
+	split := len(str) - decimals
+	intPart := str[:split]
+	if intPart == "" {
+		intPart = "0"
+	}
+	fracPart := strings.TrimRight(str[split:], "0")
+	if fracPart == "" {
+		return sign + intPart
+	}
+	return sign + intPart + "." + fracPart
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
 		}
 	}
 	return ""
 }
 
-func walletHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	walletAddress := vars["address"]
-
-	// Basic validation for Ethereum address
-	if len(walletAddress) != 42 || !strings.HasPrefix(walletAddress, "0x") {
-		log.Printf("Invalid Ethereum address format received: %s", walletAddress)
-		http.Error(w, "Invalid Ethereum address format. Expected 42 characters starting with 0x", http.StatusBadRequest)
-		return
+func validateWalletAddress(address string) error {
+	if len(address) != 42 || !strings.HasPrefix(address, "0x") {
+		return ErrInvalidWalletAddress
 	}
+	return nil
+}
 
-	walletData, err := getWalletTokens(walletAddress)
-	if err != nil {
-		log.Printf("Error fetching wallet data for address %s: %v", walletAddress, err)
-		http.Error(w, "Failed to fetch wallet token data. Please try again later.", http.StatusInternalServerError)
-		return
-	}
+func walletHandler(tracker *WalletTracker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		walletAddress := vars["address"]
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(walletData); err != nil {
-		log.Printf("Error encoding JSON response for address %s: %v", walletAddress, err)
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		if err := validateWalletAddress(walletAddress); err != nil {
+			log.Printf("Invalid Ethereum address format received: %s", walletAddress)
+			http.Error(w, "Invalid Ethereum address format. Expected 42 characters starting with 0x", http.StatusBadRequest)
+			return
+		}
+
+		walletData, err := tracker.GetWalletTokens(r.Context(), walletAddress)
+		if err != nil {
+			if errors.Is(err, ErrNoTransactions) {
+				walletData = &WalletResponse{Address: walletAddress, Tokens: []TokenBalance{}}
+			} else if errors.Is(err, ErrInvalidWalletAddress) {
+				http.Error(w, "Invalid Ethereum address format. Expected 42 characters starting with 0x", http.StatusBadRequest)
+				return
+			} else {
+				log.Printf("Error fetching wallet data for address %s: %v", walletAddress, err)
+				http.Error(w, "Failed to fetch wallet token data. Please try again later.", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(walletData); err != nil {
+			log.Printf("Error encoding JSON response for address %s: %v", walletAddress, err)
+			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		}
 	}
 }
 
-func setupRoutes() *mux.Router {
+func setupRoutes(tracker *WalletTracker) *mux.Router {
 	r := mux.NewRouter()
-	r.HandleFunc("/wallet/{address}", walletHandler).Methods("GET")
+	r.HandleFunc("/wallet/{address}", walletHandler(tracker)).Methods("GET")
 	return r
 }
 
-func startServer() {
-	router := setupRoutes()
+func startServer(tracker *WalletTracker) {
+	router := setupRoutes(tracker)
 	fmt.Println("Starting server on :8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
 }

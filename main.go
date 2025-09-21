@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 
 	mcp_golang "github.com/metoro-io/mcp-golang"
@@ -15,6 +16,8 @@ func main() {
 	// Initialize MCP server with stdio transport
 	server := mcp_golang.NewServer(stdio.NewStdioServerTransport())
 
+	registerWalletTracker(*server)
+
 	// Register tools, prompts, and resources here...
 
 	// Start the server
@@ -25,4 +28,21 @@ func main() {
 	}
 
 	select {} // Keeps the server running
+}
+
+func registerWalletTracker(server *mcp_golang.Server) {
+	// Register "wallet tracker" tool
+	err := server.RegisterTool("wallet_tracker", "Track the balance of a cryptocurrency wallet", func(walletAddress string) (*mcp_golang.ToolResponse, error) {
+		walletResp, err := getWalletTokens(walletAddress)
+		if err != nil {
+			return nil, err
+		}
+
+		return mcp_golang.NewToolResponse(mcp_golang.NewTextContent(fmt.Sprintf("Wallet Address: %s\nTokens: %+v", walletResp.Address, walletResp.Tokens))), nil
+
+	})
+
+	if err != nil {
+		log.Fatalf("Failed to register wallet tracker tool: %v", err)
+	}
 }

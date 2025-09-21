@@ -16,9 +16,8 @@ func main() {
 	// Initialize MCP server with stdio transport
 	server := mcp_golang.NewServer(stdio.NewStdioServerTransport())
 
-	registerWalletTracker(*server)
-
 	// Register tools, prompts, and resources here...
+	registerWalletTracker(server)
 
 	// Start the server
 	log.Println("MCP Server is now running and waiting for requests...")
@@ -30,16 +29,18 @@ func main() {
 	select {} // Keeps the server running
 }
 
+type WalletTrackerRequest struct {
+	WalletAddress string `json:"wallet_address" description:"The cryptocurrency wallet address to track"`
+}
+
 func registerWalletTracker(server *mcp_golang.Server) {
 	// Register "wallet tracker" tool
-	err := server.RegisterTool("wallet_tracker", "Track the balance of a cryptocurrency wallet", func(walletAddress string) (*mcp_golang.ToolResponse, error) {
-		walletResp, err := getWalletTokens(walletAddress)
+	err := server.RegisterTool("wallet_tracker", "Track the balance of a cryptocurrency wallet", func(req WalletTrackerRequest) (*mcp_golang.ToolResponse, error) {
+		walletResp, err := getWalletTokens(req.WalletAddress)
 		if err != nil {
 			return nil, err
 		}
-
 		return mcp_golang.NewToolResponse(mcp_golang.NewTextContent(fmt.Sprintf("Wallet Address: %s\nTokens: %+v", walletResp.Address, walletResp.Tokens))), nil
-
 	})
 
 	if err != nil {

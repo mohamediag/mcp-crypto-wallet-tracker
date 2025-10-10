@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	etherscanBaseURL   = "https://api.etherscan.io/api"
+	etherscanBaseURL   = "https://api.etherscan.io/v2/api"
 	defaultHTTPTimeout = 10 * time.Second
 )
 
@@ -91,6 +91,7 @@ func (t *WalletTracker) fetchTokenTransactions(ctx context.Context, walletAddres
 	}
 
 	query := endpoint.Query()
+	query.Set("chainid", "1")
 	query.Set("module", "account")
 	query.Set("action", "tokentx")
 	query.Set("address", walletAddress)
